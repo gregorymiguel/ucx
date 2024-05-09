@@ -195,7 +195,11 @@ class TablesMigrator:
             logger.info(f"View {src_view.src.key} already migrated to {src_view.rule.as_uc_table_key}")
             return True
         if self._view_can_be_migrated(src_view):
-            return self._migrate_view_table(src_view, grants)
+            try:
+                return self._migrate_view_table(src_view, grants)
+            except BadRequest as e:
+                if (any(item) in "UNRESOLVED_COLUMN.WITH_SUGGESTION" for item in e.args):
+                    logger.warning(f"Failed to migrate View {src_view.src.key}. The View might be in an invalid state. {e}")
         logger.info(f"View {src_view.src.key} is not supported for migration")
         return True
 
