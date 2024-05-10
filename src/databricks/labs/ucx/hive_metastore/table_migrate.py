@@ -29,7 +29,7 @@ from databricks.labs.ucx.hive_metastore.view_migrate import (
     ViewToMigrate,
 )
 from databricks.labs.ucx.workspace_access.groups import GroupManager, MigratedGroup
-from databricks.sdk.errors.platform import BadRequest, NotFound
+from databricks.sdk.errors.platform import DatabricksError
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +59,7 @@ class TablesMigrator:
     def index(self):
         return self._migration_status_refresher.index()
 
-    def _index_with_reset(self):
+    def index_full_refresh(self):
         # when we want the latest up-to-date status, e.g. to determine whether views dependencies have been migrated
         self._migration_status_refresher.reset()
         return self._migration_status_refresher.index()
@@ -121,7 +121,7 @@ class TablesMigrator:
     def _migrate_views(self, acl_strategy, all_grants_to_migrate, all_migrated_groups, all_principal_grants):
         tables_to_migrate = self._tm.get_tables_to_migrate(self._tc)
         all_tasks = []
-        sequencer = ViewsMigrationSequencer(tables_to_migrate, self._index_with_reset())
+        sequencer = ViewsMigrationSequencer(tables_to_migrate, self.index_full_refresh())
         batches = sequencer.sequence_batches()
         for batch in batches:
             tasks = []
@@ -206,7 +206,7 @@ class TablesMigrator:
     def _view_can_be_migrated(self, view: ViewToMigrate):
         # dependencies have already been computed, therefore an empty dict is good enough
         for table in view.dependencies:
-            if not self._index_with_reset().get(table.schema, table.name):
+            if not self.index_full_refresh().get(table.schema, table.name):
                 logger.info(f"View {view.src.key} cannot be migrated because {table.key} is not migrated yet")
                 return False
         return True
@@ -214,9 +214,15 @@ class TablesMigrator:
     def _migrate_view_table(self, src_view: ViewToMigrate, grants: list[Grant] | None = None):
         view_migrate_sql = self._sql_migrate_view(src_view)
         logger.debug(f"Migrating view {src_view.src.key} to using SQL query: {view_migrate_sql}")
-        self._backend.execute(view_migrate_sql)
-        self._backend.execute(src_view.src.sql_alter_to(src_view.rule.as_uc_table_key))
-        self._backend.execute(src_view.src.sql_alter_from(src_view.rule.as_uc_table_key, self._ws.get_workspace_id()))
+        try:
+            self._backend.execute(view_migrate_sql)
+            self._backend.execute(src_view.src.sql_alter_to(src_view.rule.as_uc_table_key))
+            self._backend.execute(
+                src_view.src.sql_alter_from(src_view.rule.as_uc_table_key, self._ws.get_workspace_id())
+            )
+        except DatabricksError as e:
+            logger.warning(f"Failed to migrate view {src_view.src.key} to {src_view.rule.as_uc_table_key}: {e}")
+            return False
         return self._migrate_acl(src_view.src, src_view.rule, grants)
 
     def _sql_migrate_view(self, src_view: ViewToMigrate) -> str:
@@ -235,7 +241,8 @@ class TablesMigrator:
         sync_result = next(iter(self._backend.fetch(table_migrate_sql)))
         if sync_result.status_code != "SUCCESS":
             logger.warning(
-                f"SYNC command failed to migrate {src_table.key} to {target_table_key}. Status code: {sync_result.status_code}. Description: {sync_result.description}"
+                f"SYNC command failed to migrate table {src_table.key} to {target_table_key}. "
+                f"Status code: {sync_result.status_code}. Description: {sync_result.description}"
             )
             return False
         self._backend.execute(src_table.sql_alter_from(rule.as_uc_table_key, self._ws.get_workspace_id()))
@@ -275,9 +282,13 @@ class TablesMigrator:
         logger.debug(
             f"Migrating external table {src_table.key} to {rule.as_uc_table_key} using SQL query: {table_migrate_sql}"
         )
-        self._backend.execute(table_migrate_sql)
-        self._backend.execute(src_table.sql_alter_to(rule.as_uc_table_key))
-        self._backend.execute(src_table.sql_alter_from(rule.as_uc_table_key, self._ws.get_workspace_id()))
+        try:
+            self._backend.execute(table_migrate_sql)
+            self._backend.execute(src_table.sql_alter_to(rule.as_uc_table_key))
+            self._backend.execute(src_table.sql_alter_from(rule.as_uc_table_key, self._ws.get_workspace_id()))
+        except DatabricksError as e:
+            logger.warning(f"Failed to migrate table {src_table.key} to {rule.as_uc_table_key}: {e}")
+            return False
         return self._migrate_acl(src_table, rule, grants)
 
     def _migrate_dbfs_root_table(self, src_table: Table, rule: Rule, grants: list[Grant] | None = None):
@@ -286,9 +297,13 @@ class TablesMigrator:
         logger.debug(
             f"Migrating managed table {src_table.key} to {rule.as_uc_table_key} using SQL query: {table_migrate_sql}"
         )
-        self._backend.execute(table_migrate_sql)
-        self._backend.execute(src_table.sql_alter_to(rule.as_uc_table_key))
-        self._backend.execute(src_table.sql_alter_from(rule.as_uc_table_key, self._ws.get_workspace_id()))
+        try:
+            self._backend.execute(table_migrate_sql)
+            self._backend.execute(src_table.sql_alter_to(rule.as_uc_table_key))
+            self._backend.execute(src_table.sql_alter_from(rule.as_uc_table_key, self._ws.get_workspace_id()))
+        except DatabricksError as e:
+            logger.warning(f"Failed to migrate table {src_table.key} to {rule.as_uc_table_key}: {e}")
+            return False
         return self._migrate_acl(src_table, rule, grants)
 
     def _migrate_table_create_ctas(self, src_table: Table, rule: Rule, grants: list[Grant], mounts: list[Mount]):
@@ -303,9 +318,13 @@ class TablesMigrator:
                 dst_table_location = ExternalLocations.resolve_mount(src_table.location, mounts) + "_ctas_migrated"
             table_migrate_sql = src_table.sql_migrate_ctas_external(rule.as_uc_table_key, dst_table_location)
         logger.debug(f"Migrating table {src_table.key} to {rule.as_uc_table_key} using SQL query: {table_migrate_sql}")
-        self._backend.execute(table_migrate_sql)
-        self._backend.execute(src_table.sql_alter_to(rule.as_uc_table_key))
-        self._backend.execute(src_table.sql_alter_from(rule.as_uc_table_key, self._ws.get_workspace_id()))
+        try:
+            self._backend.execute(table_migrate_sql)
+            self._backend.execute(src_table.sql_alter_to(rule.as_uc_table_key))
+            self._backend.execute(src_table.sql_alter_from(rule.as_uc_table_key, self._ws.get_workspace_id()))
+        except DatabricksError as e:
+            logger.warning(f"Failed to migrate table {src_table.key} to {rule.as_uc_table_key}: {e}")
+            return False
         return self._migrate_acl(src_table, rule, grants)
 
     def _migrate_acl(self, src: Table, rule: Rule, grants: list[Grant] | None):
@@ -319,7 +338,7 @@ class TablesMigrator:
             logger.debug(f"Migrating acls on {rule.as_uc_table_key} using SQL query: {acl_migrate_sql}")
             try:
                 self._backend.execute(acl_migrate_sql)
-            except (BadRequest, NotFound) as e:
+            except DatabricksError as e:
                 logger.warning(f"Failed to migrate ACL for {src.key} to {rule.as_uc_table_key}: {e}")
         return True
 
@@ -364,8 +383,11 @@ class TablesMigrator:
         logger.info(
             f"Reverting {table.object_type} table {table.database}.{table.name} upgraded_to {table.upgraded_to}"
         )
-        self._backend.execute(table.sql_unset_upgraded_to())
-        self._backend.execute(f"DROP {table.kind} IF EXISTS {target_table_key}")
+        try:
+            self._backend.execute(table.sql_unset_upgraded_to())
+            self._backend.execute(f"DROP {table.kind} IF EXISTS {target_table_key}")
+        except DatabricksError as e:
+            logger.warning(f"Failed to revert table {table.key}: {e}")
 
     def _get_revert_count(self, schema: str | None = None, table: str | None = None) -> list[MigrationCount]:
         self._init_seen_tables()
